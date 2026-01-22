@@ -1,0 +1,975 @@
+#!/usr/bin/env python3
+"""
+Subtitle Converter - VTT to SRT and SRT to VTT
+For use with Platypus to create a native macOS app
+"""
+
+
+import sys
+import os
+import re
+import html
+from datetime import datetime, timedelta
+import subprocess
+import tempfile
+import time
+
+# --- Preflight helpers for CLT/Swift availability ---
+def _swift_available() -> bool:
+    """Return True if Swift is available on this system."""
+    try:
+        return subprocess.run(['/usr/bin/swift', '--version'], capture_output=True).returncode == 0
+    except Exception:
+        return False
+
+def _clt_installed() -> bool:
+    """Return True if Apple Command Line Tools are installed."""
+    try:
+        return subprocess.run(['/usr/bin/xcode-select', '-p'], capture_output=True).returncode == 0
+    except Exception:
+        return False
+
+# --- Headless CLT install attempt (falls back to GUI if it fails) ---
+
+def _parse_clt_label(sw_out: str) -> str:
+    """Extract a suitable 'Command Line Tools' label from softwareupdate -l output."""
+    label = None
+    for raw in (sw_out or '').splitlines():
+        line = raw.strip()
+        if 'Label:' in line and 'Command Line Tools' in line:
+            # Expected format: "* Label: Command Line Tools for Xcode-15.3"
+            try:
+                label = line.split('Label:')[1].strip()
+            except Exception:
+                continue
+    return label or ''
+
+
+def _install_clt_headless(max_wait_sec: int = 900) -> bool:
+    """
+    Try to install Apple Command Line Tools non-interactively using softwareupdate.
+    Returns True if Swift becomes available within max_wait_sec; False otherwise.
+    """
+    try:
+        # Make CLT visible to softwareupdate and query label
+        subprocess.run(['/usr/bin/touch', '/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress'], check=False)
+        proc = subprocess.run(['/usr/sbin/softwareupdate', '-l'], capture_output=True, text=True)
+        label = _parse_clt_label(proc.stdout if proc.returncode == 0 else '')
+        if not label:
+            print('ℹ️  No "Command Line Tools" label found via softwareupdate; headless install not available on this OS.')
+            return False
+        print(f'⬇️  Attempting headless install of: {label}')
+        # Install the specific label; this may require admin authorization
+        inst = subprocess.run(['/usr/sbin/softwareupdate', '-i', label], text=True)
+        if inst.returncode != 0:
+            print(f'⚠️  softwareupdate returned {inst.returncode}; headless install likely failed.')
+            return False
+        # Poll for Swift availability
+        start = time.time()
+        while time.time() - start < max_wait_sec:
+            if _swift_available():
+                print('✅ Command Line Tools installed (Swift found).')
+                return True
+            time.sleep(5)
+        print('⚠️  Headless install timed out waiting for Swift to appear.')
+        return _swift_available()
+    finally:
+        subprocess.run(['/bin/rm', '-f', '/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress'], check=False)
+
+# --- Checkbox dialog for options ---
+
+# --- Checkbox dialog for options ---
+def show_checkbox_dialog():
+    """
+    Pops a Swift checkbox dialog (like your TE Tool) and returns a dict:
+    { 'TO_SRT':0/1, 'TO_VTT':0/1, 'TO_TTML':0/1, 'KEEP_BIU':0/1 }
+    Falls back to sensible defaults if Swift is unavailable.
+    """
+    swift_src = r'''
+import Cocoa
+import Foundation
+let app = NSApplication.shared
+app.setActivationPolicy(.regular)
+let W: CGFloat = 380, H: CGFloat = 210
+let win = NSWindow(contentRect: NSRect(x:0,y:0,width:W,height:H),
+                   styleMask:[.titled,.closable],
+                   backing:.buffered, defer:false)
+win.center()
+win.title = "Convert captions to…"
+let content = NSView(frame: NSRect(x:0,y:0,width:W,height:H))
+win.contentView = content
+func addCheck(_ title:String,_ y:CGFloat,_ on:Bool=true)->NSButton{
+  let c=NSButton(checkboxWithTitle:title, target:nil, action:nil)
+  c.frame=NSRect(x:24,y:y,width:W-48,height:22)
+  c.state = on ? .on : .off
+  content.addSubview(c)
+  return c
+}
+let srtC  = addCheck("SRT (.srt)",              150, true)
+let vttC  = addCheck("WebVTT (.vtt)",           120, true)
+let ttmlC = addCheck("SMPTE‑TT / TTML (.ttml)",  90, true)
+let ok=NSButton(title:"OK", target:NSApp, action:#selector(NSApplication.stop(_:)))
+ok.frame = NSRect(x:W/2-40,y:12,width:80,height:28)
+content.addSubview(ok)
+win.makeKeyAndOrderFront(nil)
+NSApp.activate(ignoringOtherApps:true)
+NSApp.run()
+func p(_ k:String,_ v:Bool){ print("\(k)=\(v ? 1:0)") }
+p("TO_SRT",  srtC.state == .on)
+p("TO_VTT",  vttC.state == .on)
+p("TO_TTML", ttmlC.state == .on)
+'''
+    try:
+        with tempfile.NamedTemporaryFile('w', suffix='.swift', delete=False) as tf:
+            tf.write(swift_src)
+            path = tf.name
+        p = subprocess.run(['/usr/bin/swift', path], capture_output=True, text=True)
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+        if p.returncode != 0 or not p.stdout.strip():
+            return {'TO_SRT':1, 'TO_VTT':1, 'TO_TTML':1}
+        result = {}
+        for line in p.stdout.strip().splitlines():
+            if '=' in line:
+                k, v = line.strip().split('=', 1)
+                result[k] = 1 if v.strip() == '1' else 0
+        # Ensure at least one output is selected
+        if not any(result.get(k)==1 for k in ('TO_SRT','TO_VTT','TO_TTML')):
+            result['TO_SRT'] = 1
+        return result
+    except Exception:
+        return {'TO_SRT':1, 'TO_VTT':1, 'TO_TTML':1}
+
+def parse_timestamp_vtt(timestamp):
+    """Parse VTT timestamp (HH:MM:SS.mmm or MM:SS.mmm) to seconds"""
+    parts = timestamp.split(':')
+    if len(parts) == 3:  # HH:MM:SS.mmm
+        hours, minutes, seconds = parts
+    else:  # MM:SS.mmm
+        hours = '0'
+        minutes, seconds = parts
+    
+    seconds_parts = seconds.split('.')
+    sec = int(seconds_parts[0])
+    ms = int(seconds_parts[1]) if len(seconds_parts) > 1 else 0
+    
+    total_seconds = int(hours) * 3600 + int(minutes) * 60 + sec + ms / 1000
+    return total_seconds
+
+def parse_timestamp_srt(timestamp):
+    """Parse SRT timestamp (HH:MM:SS,mmm) to seconds"""
+    time_part = timestamp.split(',')
+    hms = time_part[0].split(':')
+    ms = int(time_part[1]) if len(time_part) > 1 else 0
+    
+    hours, minutes, seconds = map(int, hms)
+    total_seconds = hours * 3600 + minutes * 60 + seconds + ms / 1000
+    return total_seconds
+
+def seconds_to_vtt_timestamp(seconds):
+    """Convert seconds to VTT timestamp format (HH:MM:SS.mmm)"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs_float = seconds % 60
+    secs = int(secs_float)
+    ms = int(round((secs_float - secs) * 1000))
+    # Carry over if rounding produced 1000 ms
+    if ms == 1000:
+        ms = 0
+        secs += 1
+        if secs == 60:
+            secs = 0
+            minutes += 1
+            if minutes == 60:
+                minutes = 0
+                hours += 1
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
+
+def seconds_to_srt_timestamp(seconds):
+    """Convert seconds to SRT timestamp format (HH:MM:SS,mmm)"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs_float = seconds % 60
+    secs = int(secs_float)
+    ms = int(round((secs_float - secs) * 1000))
+    if ms == 1000:
+        ms = 0
+        secs += 1
+        if secs == 60:
+            secs = 0
+            minutes += 1
+            if minutes == 60:
+                minutes = 0
+                hours += 1
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+def strip_formatting(text, keep_biu=False):
+    """Remove HTML/formatting tags. If keep_biu, preserve only <i>/<b>/<u> and <br>. Always preserve bracketed descriptors like [MUSIC] and {SFX}."""
+    if keep_biu:
+        def repl(m):
+            tag = m.group(1).lower()
+            return m.group(0) if tag in ('i','/i','b','/b','u','/u','br','/br') else ''
+        text = re.sub(r'<\s*/?\s*([^ >/]+)(?:\s+[^>]*)?>', repl, text)
+        text = re.sub(r'(?i)<br\s*/?>', '<br/>', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+    # Strict removal: strip HTML tags only; preserve bracketed descriptors like [MUSIC] or {SFX}
+    text = re.sub(r'</?[^>]+>', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+# ---- Helpers for entity handling ------------------------------------------------
+# Decode a minimal set of common HTML entities to plain text for SRT output
+# Keeps SRT clean and avoids carrying WebVTT-specific escapes into SRT
+
+def decode_basic_entities(text: str) -> str:
+    return (text
+            .replace('&amp;', '&')
+            .replace('&lt;', '<')
+            .replace('&gt;', '>')
+            .replace('&nbsp;', ' ')
+            .replace('&lrm;', '')
+            .replace('&rlm;', ''))
+
+# Normalize WebVTT cue tags so only <v> and <lang> carry annotations.
+# Also normalize <c> classes: convert space-separated tokens into dot classes.
+# Unknown tags are escaped so they don't break validation.
+ALLOWED_VTT_TAGS = {"b", "i", "u", "c", "ruby", "rt", "v", "lang"}
+_TAG_CAPTURE = re.compile(r"<(/?)([A-Za-z]+)([^>]*)>")
+_ALLOWED_ANY_TAG = re.compile(r"</?(?:b|i|u|c|ruby|rt|v|lang)(?:[^>]*)>")
+
+
+def normalize_vtt_tags(text: str) -> str:
+    def _replace(m):
+        slash, name, rest = m.group(1), m.group(2).lower(), m.group(3)
+        if name not in ALLOWED_VTT_TAGS:
+            # Unknown tag: escape
+            return f"&lt;{('/' if slash else '')}{name}{rest}&gt;"
+
+        if slash:
+            # End tag: allow only for known tags
+            return f"</{name}>"
+
+        rest = (rest or "")
+        # Clean whitespace
+        rest_stripped = re.sub(r"\s+", " ", rest).strip()
+
+        if name in ("v", "lang"):
+            # Keep annotation (speaker or language), if any
+            ann = rest_stripped
+            # Guard against stray '<' or '>' inside annotation
+            ann = ann.replace('<', '').replace('>', '')
+            return f"<{name}{(' ' + ann) if ann else ''}>"
+
+        if name == "c":
+            # Convert space-separated or weird class syntax to dot classes
+            tokens = [t for t in re.split(r"[\s\.]+", rest_stripped) if t]
+            classes = []
+            for t in tokens:
+                t = re.sub(r"[^A-Za-z0-9_-]", "", t)
+                if t:
+                    classes.append(t)
+            return f"<c.{'.'.join(classes)}>" if classes else "<c>"
+
+        # Other allowed tags (<b>, <i>, <u>, <ruby>, <rt>) must not have annotation
+        return f"<{name}>"
+
+    return _TAG_CAPTURE.sub(_replace, text)
+
+
+def escape_angles_outside_allowed_tags(text: str) -> str:
+    # Temporarily protect allowed tags, escape any remaining '<' and '>'
+    placeholders = []
+
+    def _store(m):
+        placeholders.append(m.group(0))
+        return f"@@TAG{len(placeholders)-1}@@"
+
+    protected = _ALLOWED_ANY_TAG.sub(_store, text)
+    escaped = protected.replace('<', '&lt;').replace('>', '&gt;')
+
+    for idx, tag in enumerate(placeholders):
+        escaped = escaped.replace(f"@@TAG{idx}@@", tag)
+    return escaped
+
+# Enforce basic WebVTT tag context and balance
+# - Ensures <rt> only appears when a <ruby> is currently open
+# - Balances simple nesting by auto-closing any unclosed tags at line end
+# - Escapes spurious closing tags that don't match anything open
+# This reduces validator errors like "Incorrect start tag."
+
+def enforce_vtt_tag_context(text: str) -> str:
+    out = []
+    pos = 0
+    stack = []  # track open tags in order
+    for m in _TAG_CAPTURE.finditer(text):
+        # push raw text before this tag
+        if m.start() > pos:
+            out.append(text[pos:m.start()])
+        pos = m.end()
+
+        slash, name, rest = m.group(1), m.group(2).lower(), (m.group(3) or "")
+        if name not in ALLOWED_VTT_TAGS:
+            # Unknown tag — escape it
+            out.append(text[m.start():m.end()].replace('<', '&lt;').replace('>', '&gt;'))
+            continue
+
+        if slash:
+            # End tag: close if it matches something in stack; otherwise escape
+            if name in stack:
+                # close up to this tag
+                while stack and stack[-1] != name:
+                    out.append(f"</{stack.pop()}>")
+                out.append(f"</{name}>")
+                stack.pop()
+            else:
+                out.append(f"&lt;/{name}&gt;")
+            continue
+
+        # Start tag rules
+        if name == 'rt' and ('ruby' not in stack):
+            # <rt> outside of <ruby> is invalid — escape the start tag
+            out.append("&lt;rt&gt;")
+            continue
+
+        # Allowed start tag (annotation already normalized upstream)
+        out.append(f"<{name}>")
+        stack.append(name)
+
+    # append trailing text
+    out.append(text[pos:])
+
+    # auto-close any remaining open tags in LIFO order
+    while stack:
+        out.append(f"</{stack.pop()}>")
+
+    return ''.join(out)
+
+# Ensure a blank line after the WEBVTT header and before every cue timestamp
+_VTT_TS_LINE = re.compile(r'^\s*\d{2}:\d{2}:\d{2}\.\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}\.\d{3}')
+
+# Ensure a blank line after the WEBVTT header and before every cue timestamp
+_VTT_TS_LINE = re.compile(r'^\s*\d{2}:\d{2}:\d{2}\.\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}\.\d{3}')
+
+def normalize_vtt_blank_lines(vtt_text: str) -> str:
+    lines = vtt_text.splitlines()
+    out = []
+    inserted = 0
+    i = 0
+
+    # Header normalization: keep WEBVTT, then exactly one blank line
+    if i < len(lines) and lines[i].strip().upper().startswith('WEBVTT'):
+        out.append('WEBVTT')
+        i += 1
+        # skip any number of blanks after header
+        while i < len(lines) and lines[i].strip() == '':
+            i += 1
+        out.append('')
+        inserted += 1
+
+    # Process remaining lines and ensure a blank line before each cue timestamp
+    for k in range(i, len(lines)):
+        line = lines[k].rstrip()
+        if _VTT_TS_LINE.match(line):
+            if out and out[-1] != '':
+                out.append('')
+                inserted += 1
+        out.append(line)
+
+    result = '\n'.join(out)
+    if inserted:
+        print(f"🧹 Normalized VTT spacing: inserted {inserted} blank line(s) before cue(s)")
+    return result
+
+# Ensure VTT timestamps include a decimal separator with exactly three digits
+# Fixes validator error: "No decimal separator (".") found."
+_VTT_TS_DECIMAL = re.compile(
+    r'^(\s*)(\d{1,2}:\d{2}(?::\d{2})?)(\.\d{1,3})?\s+-->\s+(\d{1,2}:\d{2}(?::\d{2})?)(\.\d{1,3})?(\s.*)?$'
+)
+
+def normalize_vtt_timestamp_decimals(vtt_text: str) -> str:
+    fixed = 0
+    lines = vtt_text.splitlines()
+
+    def norm_ms(ms: str) -> str:
+        nonlocal fixed
+        if ms is None:
+            fixed += 1
+            return '.000'
+        digits = ms[1:]
+        if len(digits) < 3:
+            fixed += 1
+            return '.' + digits.ljust(3, '0')
+        if len(digits) > 3:
+            fixed += 1
+            return '.' + digits[:3]
+        return ms
+
+    for i, line in enumerate(lines):
+        m = _VTT_TS_DECIMAL.match(line)
+        if not m:
+            continue
+        pre, s, s_ms, e, e_ms, tail = m.groups()
+        s_ms = norm_ms(s_ms)
+        e_ms = norm_ms(e_ms)
+        lines[i] = f"{pre}{s}{s_ms} --> {e}{e_ms}{tail or ''}"
+
+    result = '\n'.join(lines)
+    if fixed:
+        print(f"⏱️ Normalized VTT timestamps: adjusted decimals on {fixed} token(s)")
+    return result
+
+# Sanitize lines for WebVTT: any bare '&' not starting a valid entity gets
+# converted to '&amp;'; also escape literal '<' and '>' so they aren't
+# misinterpreted as tags. This fixes "Incorrect escape" errors.
+
+def sanitize_vtt_text_lines(lines):
+    out = []
+    pattern = re.compile(r'&(?!amp;|lt;|gt;|lrm;|rlm;|nbsp;|#\d+;|#x[0-9A-Fa-f]+;)')
+    for t in lines:
+        t2 = pattern.sub('&amp;', t)
+        t2 = normalize_vtt_tags(t2)
+        t2 = enforce_vtt_tag_context(t2)
+        t2 = escape_angles_outside_allowed_tags(t2)
+        out.append(t2)
+    return out
+
+# ---- Helper: merge consecutive cues that share the same timecodes (within tolerance)
+# This fixes cases where one caption line is split across multiple numbered cues
+# with identical start/end times (e.g., broken SRT exports).
+def merge_cues_by_time(cues, tol_ms=50):
+    tol = tol_ms / 1000.0
+    merged = []
+    for cue in cues:
+        if merged and abs(cue['start'] - merged[-1]['start']) <= tol and abs(cue['end'] - merged[-1]['end']) <= tol:
+            # same timing → merge text lines
+            prev = merged[-1]
+            for t in cue['text']:
+                if t:  # skip empty lines
+                    prev['text'].append(t)
+        else:
+            merged.append({
+                'start': cue['start'],
+                'end': cue['end'],
+                'text': list(cue['text'])
+            })
+    return merged
+
+# ---- New helpers: sort and enforce non-overlap ----
+def sort_cues_by_start(cues):
+    """Sort cues in-place by (start, end). Return True if order changed."""
+    before = [(c['start'], c['end']) for c in cues]
+    cues.sort(key=lambda c: (c['start'], c['end']))
+    after = [(c['start'], c['end']) for c in cues]
+    return before != after
+
+def enforce_no_overlap_shrink_prev(cues, epsilon_ms=5):
+    """
+    Enforce a minimum gap between cues (not just remove overlap).
+    Ensures cue[i+1].start - cue[i].end >= eps, shrinking previous end or pushing next start.
+    Returns the number of adjustments made.
+    """
+    eps = epsilon_ms / 1000.0
+    adjusted = 0
+    n = len(cues)
+    for i in range(n - 1):
+        cur = cues[i]
+        nxt = cues[i + 1]
+        gap = nxt['start'] - cur['end']
+        if gap >= eps:
+            continue  # already has sufficient gap
+        # Need to enforce gap >= eps
+        target_end = nxt['start'] - eps
+        if target_end > cur['start']:
+            if target_end < cur['end'] - 1e-12:
+                cur['end'] = target_end
+                adjusted += 1
+        else:
+            # Can't shrink without collapsing; push next start forward
+            new_start = cur['end'] + eps
+            if new_start > nxt['start'] + 1e-12:
+                nxt['start'] = new_start
+                adjusted += 1
+        # After any adjustment, ensure nxt keeps end > start by at least eps
+        if nxt['end'] < nxt['start'] + eps:
+            nxt['end'] = nxt['start'] + eps
+            adjusted += 1
+    return adjusted
+
+# ---- Helper: ensure end timestamp is strictly greater than start timestamp
+# Nudge end times by a tiny epsilon (default 2 ms) if end <= start
+# This keeps the visual change negligible while satisfying strict validators
+
+def ensure_end_after_start(cues, epsilon_ms=2):
+    eps = epsilon_ms / 1000.0
+    fixed = 0
+    for cue in cues:
+        if cue['end'] <= cue['start']:
+            cue['end'] = cue['start'] + eps
+            fixed += 1
+    return fixed
+
+# --- New: ensure monotonicity of cue times across file ---
+def enforce_monotonic_across_cues(cues, epsilon_ms=2):
+    """
+    Enforce a minimum gap between cues: require cue['start'] >= last_end + eps,
+    and cue['end'] >= cue['start'] + eps.
+    Returns the number of cues adjusted.
+    """
+    eps = epsilon_ms / 1000.0
+    adjusted = 0
+    last_end = -1e9  # effectively negative infinity in seconds
+    for cue in cues:
+        # Require start >= last_end + eps
+        if cue['start'] < last_end + eps:
+            cue['start'] = last_end + eps
+            adjusted += 1
+        # Also ensure end > start by at least eps
+        if cue['end'] < cue['start'] + eps:
+            cue['end'] = cue['start'] + eps
+            adjusted += 1
+        last_end = cue['end']
+    return adjusted
+
+def vtt_to_srt(vtt_content, keep_biu=False):
+    """Convert VTT content to SRT format (with cue merge for identical timecodes)"""
+    lines = vtt_content.strip().split('\n')
+    cues = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        # Skip headers/notes/blank lines
+        if line.startswith('WEBVTT') or line == '' or line.startswith('NOTE'):
+            i += 1
+            continue
+        # Timestamp line
+        if ' --> ' in line:
+            m = re.match(r'([^\s]+)\s+-->\s+([^\s]+)', line)
+            if m:
+                start_seconds = parse_timestamp_vtt(m.group(1))
+                end_seconds = parse_timestamp_vtt(m.group(2))
+                # Gather text lines (stop at blank OR at next timestamp; filter single '-')
+                i += 1
+                text_lines = []
+                while i < len(lines):
+                    nxt = lines[i].strip()
+                    if nxt == '':
+                        break
+                    if ' --> ' in nxt:
+                        # Missing blank line between cues — stop here without consuming the timestamp
+                        break
+                    cleaned = strip_formatting(nxt, keep_biu).strip()
+                    # SAFEGUARD: if cleaning resulted in empty but original had a descriptor like [MUSIC], (laughs), {SFX}, keep the original
+                    if not cleaned and re.search(r'[\[\(\{][^\]\)\}]+[\]\)\}]', nxt):
+                        cleaned = nxt.strip()
+                    # Decode common WebVTT entities to plain text for SRT
+                    cleaned = decode_basic_entities(cleaned)
+                    if cleaned and cleaned != '-':
+                        text_lines.append(cleaned)
+                    i += 1
+                # Only add this cue if at least one text line remains
+                if text_lines:
+                    cues.append({'start': start_seconds, 'end': end_seconds, 'text': text_lines})
+        else:
+            i += 1
+    # Merge consecutive cues with identical timings
+    cues = merge_cues_by_time(cues)
+    # Sort by start time so enforcement works left-to-right
+    if sort_cues_by_start(cues):
+        print("⏩ Sorted cues by start time")
+    # Ensure end > start to satisfy strict validators
+    fixed_count = ensure_end_after_start(cues, epsilon_ms=5)
+    if fixed_count:
+        print(f"🛠️  Fixed {fixed_count} cue(s) with end≤start by +5ms")
+    # Enforce monotonic increase across cues (no backwards or equal starts)
+    adj_count = enforce_monotonic_across_cues(cues, epsilon_ms=5)
+    if adj_count:
+        print(f"🔧 Enforced monotonic cue order: adjusted {adj_count} cue(s)")
+    # Final guard: prevent any overlap by shrinking previous ends
+    clamp_count = enforce_no_overlap_shrink_prev(cues, epsilon_ms=5)
+    if clamp_count:
+        print(f"✂️  Removed overlaps by clamping previous ends: {clamp_count} adjustment(s)")
+    # Finalize: re-assert monotonic min-gap after clamping
+    final_adj = enforce_monotonic_across_cues(cues, epsilon_ms=5)
+    if final_adj:
+        print(f"✅ Finalized monotonic min-gap: {final_adj} adjustment(s)")
+    # Write SRT with renumbered indices
+    srt_output = []
+    idx = 1
+    for cue in cues:
+        if not cue['text']:
+            continue
+        srt_output.append(f"{idx}")
+        srt_output.append(f"{seconds_to_srt_timestamp(cue['start'])} --> {seconds_to_srt_timestamp(cue['end'])}")
+        srt_output.extend(cue['text'])
+        srt_output.append("")
+        idx += 1
+    return '\n'.join(srt_output)
+
+def srt_to_vtt(srt_content, keep_biu=False):
+    """Convert SRT content to VTT format (with cue merge for identical timecodes)"""
+    lines = srt_content.strip().split('\n')
+    cues = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        # Skip empty lines and numeric indices
+        if line == '' or line.isdigit():
+            i += 1
+            continue
+        # Timestamp line
+        if ' --> ' in line:
+            m = re.match(r'([^\s]+)\s+-->\s+([^\s]+)', line)
+            if m:
+                start_seconds = parse_timestamp_srt(m.group(1))
+                end_seconds = parse_timestamp_srt(m.group(2))
+                # Gather text lines (filter blank lines and single '-')
+                i += 1
+                text_lines = []
+                while i < len(lines) and lines[i].strip() != '':
+                    raw = lines[i].strip()
+                    if raw:
+                        cleaned = strip_formatting(raw, keep_biu).strip()
+                        # SAFEGUARD: if cleaning resulted in empty but original had a descriptor like [MUSIC], (laughs), {SFX}, keep the original
+                        if not cleaned and re.search(r'[\[\(\{][^\]\)\}]+[\]\)\}]', raw):
+                            cleaned = raw.strip()
+                        # remove truly blank lines and lines that are exactly '-'
+                        if cleaned and cleaned != '-':
+                            text_lines.append(cleaned)
+                    i += 1
+                # Only add this cue if at least one text line remains
+                if text_lines:
+                    cues.append({'start': start_seconds, 'end': end_seconds, 'text': text_lines})
+        else:
+            i += 1
+    # Merge consecutive cues that share the same times
+    cues = merge_cues_by_time(cues)
+    if sort_cues_by_start(cues):
+        print("⏩ Sorted cues by start time")
+    # Ensure end > start to satisfy strict validators
+    fixed_count = ensure_end_after_start(cues, epsilon_ms=5)
+    if fixed_count:
+        print(f"🛠️  Fixed {fixed_count} cue(s) with end≤start by +5ms")
+    # Enforce monotonic increase across cues
+    adj_count = enforce_monotonic_across_cues(cues, epsilon_ms=5)
+    if adj_count:
+        print(f"🔧 Enforced monotonic cue order: adjusted {adj_count} cue(s)")
+    clamp_count = enforce_no_overlap_shrink_prev(cues, epsilon_ms=5)
+    if clamp_count:
+        print(f"✂️  Removed overlaps by clamping previous ends: {clamp_count} adjustment(s)")
+    # Finalize: re-assert monotonic min-gap after clamping
+    final_adj2 = enforce_monotonic_across_cues(cues, epsilon_ms=5)
+    if final_adj2:
+        print(f"✅ Finalized monotonic min-gap: {final_adj2} adjustment(s)")
+    # Write VTT
+    vtt_output = ['WEBVTT', '']
+    for cue in cues:
+        if not cue['text']:
+            continue
+        vtt_output.append(f"{seconds_to_vtt_timestamp(cue['start'])} --> {seconds_to_vtt_timestamp(cue['end'])}")
+        safe_lines = sanitize_vtt_text_lines(cue['text'])
+        vtt_output.extend(safe_lines)
+        vtt_output.append("")
+    vtt_text = '\n'.join(vtt_output)
+    vtt_text = normalize_vtt_blank_lines(vtt_text)
+    vtt_text = normalize_vtt_timestamp_decimals(vtt_text)
+    return vtt_text
+
+ # ======== SMPTE‑TT (TTML) writer (RP 2052‑10 compliant header/region/style) ========
+
+def _join_lines_preserve(lines):
+    # Keep original line breaks; TTML will convert '\n' to <br/>
+    return '\n'.join(lines)
+
+def parse_vtt_cues_for_ttml(vtt_text):
+    cues = []
+    lines = vtt_text.splitlines()
+    i = 0
+    if i < len(lines) and lines[i].strip().upper().startswith('WEBVTT'):
+        i += 1
+        # skip header until first blank
+        while i < len(lines) and lines[i].strip() != '':
+            i += 1
+        while i < len(lines) and lines[i].strip() == '':
+            i += 1
+    while i < len(lines):
+        # optional cue identifier
+        if i + 1 < len(lines) and '-->' in lines[i+1] and lines[i].strip() and ' --> ' not in lines[i]:
+            i += 1
+        if i >= len(lines):
+            break
+        m = re.search(r'(\d{2}:\d{2}:\d{2}\.\d{3}|\d{1,2}:\d{2}\.\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}\.\d{3}|\d{1,2}:\d{2}\.\d{3})', lines[i])
+        if not m:
+            i += 1
+            continue
+        start = parse_timestamp_vtt(m.group(1))
+        end   = parse_timestamp_vtt(m.group(2))
+        i += 1
+        tlines = []
+        while i < len(lines) and lines[i].strip() != '':
+            tlines.append(lines[i].rstrip('\n'))
+            i += 1
+        # skip blank separator(s)
+        while i < len(lines) and lines[i].strip() == '':
+            i += 1
+        txt = _join_lines_preserve(tlines).strip()
+        if txt:
+            cues.append({'start': start, 'end': end, 'text': txt})
+    return cues
+
+def parse_srt_cues_for_ttml(srt_text):
+    cues = []
+    lines = srt_text.splitlines()
+    i = 0
+    while i < len(lines):
+        # skip numeric index lines and blanks
+        if lines[i].strip().isdigit() or lines[i].strip() == '':
+            i += 1
+            continue
+        if ' --> ' in lines[i]:
+            m = re.search(r'(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})', lines[i])
+            if not m:
+                i += 1
+                continue
+            start = parse_timestamp_srt(m.group(1))
+            end   = parse_timestamp_srt(m.group(2))
+            i += 1
+            tlines = []
+            while i < len(lines) and lines[i].strip() != '':
+                tlines.append(lines[i].rstrip('\n'))
+                i += 1
+            while i < len(lines) and lines[i].strip() == '':
+                i += 1
+            txt = _join_lines_preserve(tlines).strip()
+            if txt:
+                cues.append({'start': start, 'end': end, 'text': txt})
+        else:
+            i += 1
+    return cues
+
+def _map_biu_to_ttml_spans(text):
+    """
+    Preserve only <i>, <b>, <u> and <br>; map to tts:* spans for TTML.
+    All other tags are stripped. Ampersands/angles are safely escaped.
+    """
+    # Escape everything first
+    x = html.escape(text, quote=False)
+    # Restore allowed tags markers so we can map them
+    x = re.sub(r'&lt;(\/?i|\/?b|\/?u|br\s*\/?)&gt;', r'<\1>', x, flags=re.I)
+    # Normalize <br> variants
+    x = re.sub(r'(?i)<br\s*/?>', '<br/>', x)
+    # Map inline styles
+    x = re.sub(r'(?i)<i>', '<span tts:fontStyle="italic">', x)
+    x = re.sub(r'(?i)</i>', '</span>', x)
+    x = re.sub(r'(?i)<b>', '<span tts:fontWeight="bold">', x)
+    x = re.sub(r'(?i)</b>', '</span>', x)
+    x = re.sub(r'(?i)<u>', '<span tts:textDecoration="underline">', x)
+    x = re.sub(r'(?i)</u>', '</span>', x)
+    # Strip anything else that might have slipped through
+    x = re.sub(r'</?(?!span\b|br\b)[^>]+>', '', x)
+    return x
+
+def seconds_to_clock_time(sec):
+    hours = int(sec // 3600)
+    minutes = int((sec % 3600) // 60)
+    secs = int(sec % 60)
+    ms = int(round((sec - int(sec)) * 1000))
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
+
+def write_ttml(cues, outpath, xml_lang='en'):
+    """
+    Emit a TTML1 document with SMPTE‑TT (2013) namespace suitable for ingest:
+      - Root uses TTML1 namespaces (http://www.w3.org/ns/ttml)
+      - Declares smpte 2013 namespace
+      - Root carries xml:space="preserve" and ttp:timeBase="media"
+      - <layout>/<region> present with percent origin/extent and displayAlign
+      - <p> nodes reference region "pop1"; inline <i>/<b>/<u>/<br> preserved via spans
+    """
+    with open(outpath, 'w', encoding='utf-8') as f:
+        f.write("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+        f.write("<tt\n")
+        f.write("  xmlns=\"http://www.w3.org/ns/ttml\"\n")
+        f.write("  xmlns:tts=\"http://www.w3.org/ns/ttml#styling\"\n")
+        f.write("  xmlns:ttp=\"http://www.w3.org/ns/ttml#parameter\"\n")
+        f.write("  xmlns:ttm=\"http://www.w3.org/ns/ttml#metadata\"\n")
+        f.write("  xmlns:smpte=\"http://www.smpte-ra.org/schemas/2052-1/2013/smpte-tt\"\n")
+        f.write(f"  xml:lang=\"{xml_lang}\"\n")
+        f.write("  xml:space=\"preserve\"\n")
+        f.write("  ttp:timeBase=\"media\">\n")
+        f.write("  <head>\n")
+        f.write("    <metadata>\n")
+        f.write("      <ttm:title>Converted Captions</ttm:title>\n")
+        f.write("      <smpte:information>Generated by Subtitle Converter</smpte:information>\n")
+        f.write("    </metadata>\n")
+        f.write("    <styling>\n")
+        f.write("      <style xml:id=\"sDefault\" tts:fontFamily=\"monospace\" tts:fontSize=\"100%\" tts:color=\"white\" tts:lineHeight=\"normal\" tts:textOutline=\"black 1px 0px\"/>\n")
+        f.write("    </styling>\n")
+        f.write("    <layout>\n")
+        f.write("      <region xml:id=\"pop1\" tts:origin=\"10% 80%\" tts:extent=\"80% 18%\" tts:displayAlign=\"after\" tts:textAlign=\"center\"/>\n")
+        f.write("    </layout>\n")
+        f.write("  </head>\n")
+        f.write("  <body style=\"sDefault\">\n")
+        f.write("    <div>\n")
+        # Write cues
+        for idx, cue in enumerate(cues, start=1):
+            b = seconds_to_clock_time(cue["start"])  # HH:MM:SS.mmm
+            e = seconds_to_clock_time(cue["end"])    # HH:MM:SS.mmm
+            txt = cue["text"].replace('\r\n', '\n').replace('\r', '\n')
+            txt = txt.replace('\n', '<br/>')  # preserve line breaks
+            txt = _map_biu_to_ttml_spans(txt)   # map <i>/<b>/<u> to <span tts:*>
+            f.write(f"      <p xml:id=\"c{idx}\" region=\"pop1\" begin=\"{b}\" end=\"{e}\">{txt}</p>\n")
+        f.write("    </div>\n")
+        f.write("  </body>\n")
+        f.write("</tt>\n")
+
+def process_file(input_file, to_srt, to_vtt, to_ttml, keep_biu):
+    """Process one file and write selected outputs. Non-destructive for same-format outputs."""
+    if not os.path.exists(input_file):
+        print(f"⚠️  File '{input_file}' not found, skipping...")
+        return False
+
+    base, ext = os.path.splitext(input_file)
+    ext = ext.lower()
+    wrote_any = False
+
+    try:
+        with open(input_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Generate SRT
+        if to_srt:
+            if ext == '.vtt':
+                srt_text = vtt_to_srt(content, keep_biu)
+                out_srt = base + '.srt'
+            else:
+                # Normalize SRT: round-trip through VTT then back to SRT for cleanup
+                srt_text = vtt_to_srt(srt_to_vtt(content, keep_biu), keep_biu)
+                out_srt = base + '.normalized.srt'
+            with open(out_srt, 'w', encoding='utf-8') as f:
+                f.write(srt_text)
+            print(f"✅ {os.path.basename(input_file)} → {os.path.basename(out_srt)}")
+            wrote_any = True
+
+        # Generate VTT
+        if to_vtt:
+            if ext == '.srt':
+                vtt_text = srt_to_vtt(content, keep_biu)
+                out_vtt = base + '.vtt'
+            else:
+                # Normalize existing VTT via round-trip to ensure spacing/timestamps are clean
+                vtt_text = srt_to_vtt(vtt_to_srt(content, keep_biu), keep_biu)
+                out_vtt = base + '.normalized.vtt'
+            vtt_text = normalize_vtt_blank_lines(vtt_text)
+            vtt_text = normalize_vtt_timestamp_decimals(vtt_text)
+            with open(out_vtt, 'w', encoding='utf-8') as f:
+                f.write(vtt_text)
+            print(f"✅ {os.path.basename(input_file)} → {os.path.basename(out_vtt)}")
+            wrote_any = True
+
+        # Generate SMPTE‑TT (.ttml)
+        if to_ttml:
+            if ext == '.vtt':
+                cues = parse_vtt_cues_for_ttml(content)
+            elif ext == '.srt':
+                cues = parse_srt_cues_for_ttml(content)
+            else:
+                print(f"⚠️  '{os.path.basename(input_file)}' is not a .vtt or .srt file, skipping TTML…")
+                cues = []
+            if cues:
+                # Ensure valid timing for TTML as well
+                fixed1 = ensure_end_after_start(cues, epsilon_ms=5)
+                if fixed1:
+                    print(f"🛠️  Fixed {fixed1} TTML cue(s) with end≤start by +5ms")
+                fixed2 = enforce_monotonic_across_cues(cues, epsilon_ms=5)
+                if fixed2:
+                    print(f"🔧 Enforced monotonic cue order for TTML: adjusted {fixed2} cue(s)")
+                clamp3 = enforce_no_overlap_shrink_prev(cues, epsilon_ms=5)
+                if clamp3:
+                    print(f"✂️  Removed TTML overlaps by clamping previous ends: {clamp3} adjustment(s)")
+                # Finalize: re-assert monotonic min-gap after clamping
+                final_adj3 = enforce_monotonic_across_cues(cues, epsilon_ms=5)
+                if final_adj3:
+                    print(f"✅ Finalized monotonic min-gap: {final_adj3} adjustment(s)")
+
+                out_ttml = base + '.ttml'
+                write_ttml(cues, out_ttml, xml_lang='en')
+                print(f"✅ {os.path.basename(input_file)} → {os.path.basename(out_ttml)} (SMPTE‑TT)")
+                wrote_any = True
+
+        return wrote_any
+
+    except Exception as e:
+        print(f"❌ Error converting {os.path.basename(input_file)}: {str(e)}")
+        return False
+
+def preflight_or_exit():
+    if _swift_available():
+        return  # All good
+
+    # First attempt a headless install via softwareupdate
+    try:
+        print('🔍 Swift not found. Checking for Apple Command Line Tools…')
+        if not _clt_installed() or not _swift_available():
+            ok = _install_clt_headless(max_wait_sec=900)
+            if ok:
+                return
+    except Exception as e:
+        print(f'⚠️  Headless CLT install attempt failed with error: {e}')
+
+    # If we get here, headless path was unavailable or failed — fall back to GUI installer
+    try:
+        subprocess.run([
+            '/usr/bin/osascript', '-e',
+            'display dialog "Apple Command Line Tools are required to show the options popup. I will launch the installer now. After it finishes, reopen this app." buttons {"OK"} default button "OK" with icon caution'
+        ], check=False)
+    except Exception:
+        pass
+
+    subprocess.run(['/usr/bin/xcode-select', '--install'], check=False)
+    print('📦 Launched the Apple Command Line Tools GUI installer. Complete the install, then reopen this app.')
+    time.sleep(2)
+    sys.exit(0)
+
+
+def main():
+    preflight_or_exit()
+    if len(sys.argv) < 2:
+        print("Usage: Drag and drop .vtt or .srt files onto this app")
+        print("Multiple files can be processed at once")
+        print("Converted files will be saved in the same directory")
+        sys.exit(1)
+
+    input_files = sys.argv[1:]
+
+    # Show checkbox dialog (fallback to defaults if Swift missing)
+    opts = show_checkbox_dialog()
+    TO_SRT  = bool(opts.get('TO_SRT', 1))
+    TO_VTT  = bool(opts.get('TO_VTT', 1))
+    TO_TTML = bool(opts.get('TO_TTML', 1))
+    KEEP_BIU = False
+
+    print(f"📋 Processing {len(input_files)} file(s)...")
+    print("=" * 50)
+
+    successful = 0
+    failed = 0
+
+    for input_file in input_files:
+        if process_file(input_file, TO_SRT, TO_VTT, TO_TTML, KEEP_BIU):
+            successful += 1
+        else:
+            failed += 1
+
+    print("=" * 50)
+    print(f"🎉 Batch conversion complete!")
+    print(f"✅ Successful: {successful}")
+    if failed > 0:
+        print(f"❌ Failed: {failed}")
+
+    # Show completion message and wait a bit so user can see it
+    time.sleep(3)
+
+if __name__ == "__main__":
+    main()
