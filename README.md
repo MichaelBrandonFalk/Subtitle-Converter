@@ -2,9 +2,11 @@
 
 Portable rebuild of the `Subtitle Converter` app so it can ship in three ways from one repo:
 
+- A downloadable macOS app for Apple Silicon
+- A downloadable macOS app for Intel Macs
+- A downloadable Windows executable
 - A browser-only converter on GitHub Pages
 - A cross-platform Python desktop app
-- A Windows executable built by GitHub Actions
 
 ## What It Does
 
@@ -19,7 +21,7 @@ Portable rebuild of the `Subtitle Converter` app so it can ship in three ways fr
 - `src/subtitle_converter/`: portable Python source
 - `site/`: static in-browser converter for GitHub Pages
 - `.github/workflows/`: Pages deployment and Windows build automation
-- `scripts/build_windows.bat`: local Windows packaging helper
+- `scripts/`: local packaging helpers for Windows and macOS
 
 ## Local Python Usage
 
@@ -47,15 +49,21 @@ The Pages site is fully client-side. Uploaded files stay in the browser.
 
 Pushes to `main` deploy the `site/` directory through `.github/workflows/pages.yml`. If GitHub Pages has not been enabled for the repo yet, turn it on in repository settings when GitHub prompts for it.
 
-## Windows Releases
+## Downloadable Releases
 
-The Windows workflow builds a standalone `.exe` with PyInstaller.
+The release workflow builds:
 
-To create a downloadable Windows release:
+- `Subtitle-Converter-macos-arm64.zip`
+- `Subtitle-Converter-macos-intel.zip`
+- `Subtitle-Converter-windows-x64.zip`
+
+The macOS downloads are unsigned and not notarized, so some users will need to allow the app manually the first time they open it.
+
+To create a downloadable release:
 
 1. Push the repo to GitHub.
 2. Create a tag like `v1.0.0` and push it.
-3. The `Build Windows Release` workflow will attach a zipped Windows build to the GitHub release.
+3. The release workflow will attach zipped macOS Apple Silicon, macOS Intel, and Windows builds to the GitHub release.
 
 You can also run the workflow manually to get an artifact without cutting a release.
 

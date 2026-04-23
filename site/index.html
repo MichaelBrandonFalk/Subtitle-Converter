@@ -13,22 +13,79 @@
   <body>
     <main class="page-shell">
       <section class="hero">
-        <p class="eyebrow">Public Download + Browser Tool</p>
+        <p class="eyebrow">Download First, Browser Optional</p>
         <h1>Subtitle Converter</h1>
         <p class="lede">
-          Drop in an <code>.srt</code> or <code>.vtt</code> file, generate clean outputs, and download them without
-          sending your captions to a server.
+          Pick the version for your machine, download it directly, and use the browser version only if you do not want
+          to install anything.
         </p>
         <div class="hero-actions">
-          <a class="action primary" href="https://github.com/MichaelBrandonFalk/Subtitle-Converter/releases">Download Latest Release</a>
+          <a class="action primary" href="https://github.com/MichaelBrandonFalk/Subtitle-Converter/releases/latest">Open Latest Release</a>
           <a class="action secondary" href="https://github.com/MichaelBrandonFalk/Subtitle-Converter">View Source</a>
+        </div>
+      </section>
+
+      <section class="downloads">
+        <div class="panel">
+          <div class="panel-heading">
+            <p class="kicker">1. Select Version</p>
+            <h2>Downloads</h2>
+          </div>
+
+          <div class="download-grid">
+            <article class="download-card featured">
+              <p class="platform-label">Mac</p>
+              <h3>Apple Silicon</h3>
+              <p>For M1, M2, M3, and newer Macs.</p>
+              <a class="download-button" href="https://github.com/MichaelBrandonFalk/Subtitle-Converter/releases/latest/download/Subtitle-Converter-macos-arm64.zip">Download Mac</a>
+            </article>
+
+            <article class="download-card">
+              <p class="platform-label">Mac Intel</p>
+              <h3>Intel Build</h3>
+              <p>For older Intel-based Macs.</p>
+              <a class="download-button" href="https://github.com/MichaelBrandonFalk/Subtitle-Converter/releases/latest/download/Subtitle-Converter-macos-intel.zip">Download Mac Intel</a>
+            </article>
+
+            <article class="download-card">
+              <p class="platform-label">Windows</p>
+              <h3>Windows x64</h3>
+              <p>Standalone executable in a zip file.</p>
+              <a class="download-button" href="https://github.com/MichaelBrandonFalk/Subtitle-Converter/releases/latest/download/Subtitle-Converter-windows-x64.zip">Download Windows</a>
+            </article>
+          </div>
+        </div>
+
+        <div class="panel install-panel">
+          <div class="panel-heading">
+            <p class="kicker">2. Install</p>
+            <h2>Mac Install Help</h2>
+          </div>
+
+          <ol class="steps">
+            <li>Download the correct Mac zip and unzip it.</li>
+            <li>Drag <code>Subtitle Converter.app</code> into Applications.</li>
+            <li>Try opening it once.</li>
+            <li>If macOS blocks it, go to <code>System Settings &gt; Privacy &amp; Security</code> and click <code>Open Anyway</code>.</li>
+            <li>If needed, Control-click the app in Applications and choose <code>Open</code>.</li>
+          </ol>
+
+          <p class="install-note">
+            These builds are unsigned, so some Macs will show a warning the first time. Apple’s current guidance for
+            allowing an app is in
+            <a href="https://support.apple.com/en-lamr/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/26/mac/26">Open a Mac app from an unknown developer</a>.
+          </p>
+
+          <p class="install-note">
+            Windows: unzip the download, then open <code>Subtitle Converter.exe</code>.
+          </p>
         </div>
       </section>
 
       <section class="workspace">
         <div class="panel upload-panel">
           <div class="panel-heading">
-            <p class="kicker">1. Choose File</p>
+            <p class="kicker">3. Use In Browser</p>
             <h2>Browser Conversion</h2>
           </div>
 
@@ -62,7 +119,7 @@
 
         <div class="panel output-panel">
           <div class="panel-heading">
-            <p class="kicker">2. Download Outputs</p>
+            <p class="kicker">4. Download Outputs</p>
             <h2>Generated Files</h2>
           </div>
           <div id="results" class="results">
@@ -77,4 +134,3 @@
     <script src="./app.js"></script>
   </body>
   </html>
-

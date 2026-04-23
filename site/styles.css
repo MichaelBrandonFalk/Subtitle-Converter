@@ -126,8 +126,15 @@ body {
 .workspace {
   display: grid;
   gap: 18px;
-  margin-top: 22px;
+  margin-top: 18px;
   grid-template-columns: 1.05fr 0.95fr;
+}
+
+.downloads {
+  display: grid;
+  gap: 18px;
+  margin-top: 22px;
+  grid-template-columns: 1.2fr 0.8fr;
 }
 
 .panel {
@@ -224,6 +231,68 @@ body {
   gap: 14px;
 }
 
+.download-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.download-card {
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.download-card.featured {
+  background: linear-gradient(180deg, rgba(255, 245, 228, 0.95), rgba(255, 255, 255, 0.62));
+  border-color: rgba(209, 79, 47, 0.28);
+}
+
+.platform-label {
+  margin: 0 0 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 0.74rem;
+  color: var(--accent-dark);
+}
+
+.download-card h3 {
+  margin: 0;
+  font-size: 1.35rem;
+}
+
+.download-card p {
+  margin: 10px 0 18px;
+  color: var(--muted);
+}
+
+.install-panel {
+  position: relative;
+  overflow: hidden;
+}
+
+.steps {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--ink);
+  line-height: 1.7;
+}
+
+.steps li + li {
+  margin-top: 8px;
+}
+
+.install-note {
+  margin: 16px 0 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.install-note a {
+  color: var(--accent-dark);
+}
+
 .empty-state {
   display: grid;
   place-items: center;
@@ -264,6 +333,7 @@ body {
 }
 
 @media (max-width: 920px) {
+  .downloads,
   .workspace {
     grid-template-columns: 1fr;
   }
@@ -287,8 +357,8 @@ body {
     max-width: none;
   }
 
+  .download-grid,
   .options-grid {
     grid-template-columns: 1fr;
   }
 }
-
