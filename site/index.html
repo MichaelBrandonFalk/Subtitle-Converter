@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Subtitle Converter</title>
+    <meta
+      name="description"
+      content="Convert subtitle files to SRT, WebVTT, and TTML directly in your browser."
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <section class="hero">
+        <p class="eyebrow">Public Download + Browser Tool</p>
+        <h1>Subtitle Converter</h1>
+        <p class="lede">
+          Drop in an <code>.srt</code> or <code>.vtt</code> file, generate clean outputs, and download them without
+          sending your captions to a server.
+        </p>
+        <div class="hero-actions">
+          <a class="action primary" href="https://github.com/MichaelBrandonFalk/Subtitle-Converter/releases">Download Latest Release</a>
+          <a class="action secondary" href="https://github.com/MichaelBrandonFalk/Subtitle-Converter">View Source</a>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <div class="panel upload-panel">
+          <div class="panel-heading">
+            <p class="kicker">1. Choose File</p>
+            <h2>Browser Conversion</h2>
+          </div>
+
+          <label class="dropzone" for="file-input" id="dropzone">
+            <input id="file-input" type="file" accept=".srt,.vtt,text/plain" />
+            <span class="drop-title">Drop subtitle files here</span>
+            <span class="drop-copy">or click to pick a file from your machine</span>
+          </label>
+
+          <div class="current-file" id="current-file">No file selected.</div>
+
+          <div class="options-grid">
+            <label class="checkbox-card">
+              <input type="checkbox" id="to-srt" checked />
+              <span>SRT</span>
+            </label>
+            <label class="checkbox-card">
+              <input type="checkbox" id="to-vtt" checked />
+              <span>WebVTT</span>
+            </label>
+            <label class="checkbox-card">
+              <input type="checkbox" id="to-ttml" checked />
+              <span>TTML</span>
+            </label>
+          </div>
+
+          <button class="convert-button" id="convert-button" type="button">Convert In Browser</button>
+
+          <p class="privacy-note">Files stay local. This page does not upload subtitle content.</p>
+        </div>
+
+        <div class="panel output-panel">
+          <div class="panel-heading">
+            <p class="kicker">2. Download Outputs</p>
+            <h2>Generated Files</h2>
+          </div>
+          <div id="results" class="results">
+            <div class="empty-state">
+              <p>Converted outputs will appear here.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+  </html>
+

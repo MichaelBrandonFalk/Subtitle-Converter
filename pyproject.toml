@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "subtitle-converter"
+version = "1.0.0"
+description = "Cross-platform subtitle converter for SRT, VTT, and TTML"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Brandon Falk" }
+]
+
+[project.scripts]
+subtitle-converter = "subtitle_converter.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
